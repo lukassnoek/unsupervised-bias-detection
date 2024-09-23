@@ -1,6 +1,7 @@
 from copy import copy
 from itertools import product
 from collections import defaultdict
+from pathlib import Path
 import warnings
 warnings.filterwarnings("error")
 
@@ -9,53 +10,76 @@ import pandas as pd
 from tqdm import tqdm
 from scipy.stats import ttest_ind
 from sklearn.pipeline import make_pipeline
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_predict
 from unsupervised_bias_detection.clustering import BiasAwareHierarchicalKMeans
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
 
 
-def simulate_null_data(N, K, target_col, binary_target=True):
+def simulate_null_data(method, N, K, target_col):
 
-    if binary_target:
-        y = np.random.choice([0, 1], size=N)
-        model = make_pipeline(StandardScaler(), LogisticRegression())
+    # This ensures a perfectly balanced binary target 
+    y = np.random.permutation([0] * N + [1] * N)
+    model = make_pipeline(StandardScaler(), LogisticRegression())
+
+    # Simulate random design matrix `X`
+    X = np.random.randn(N*2, K)
+
+    # Split in train and test set
+    X_train, X, y_train, y = train_test_split(X, y, test_size=0.5, stratify=y)
+
+    # Obtain cross-validated predictions
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X)
+
+    # Define target
+    if target_col == 'y':
+        target = y
+    elif target_col == 'y_pred':
+        target = y_pred    
+    elif target_col == 'fp':
+        target = np.logical_and(y == 0, y_pred == 1).astype(int)
+    elif target_col == 'fn':
+        target = np.logical_and(y == 1, y_pred == 0).astype(int)
+    elif target_col == 'err':
+        target = (y != y_pred).astype(int)
+    elif target_col == 'fp_prec':
+        target = (y[y_pred == 1] != y_pred[y_pred == 1]).astype(int)
+        X = X[y_pred == 1, :]
+    elif target_col == 'fn_rec':
+        target = (y[y == 1] != y_pred[y == 1]).astype(int)
+        X = X[y == 1, :]
     else:
-        y = np.random.randn(N)
-        model = make_pipeline(StandardScaler(), LinearRegression())
-
-    X = np.random.randn(N, K)
-    cols = [f'feat_{i}' for i in range(K)]
-    y_pred = cross_val_predict(model, X, y)
-
-    if binary_target:
-        err = (y != y_pred).astype(int)
-        fp = np.logical_and(y == 0, y_pred == 1).astype(int)
-        fn = np.logical_and(y == 1, y_pred == 0).astype(int)
-        X = pd.DataFrame(
-            np.c_[X, y, y_pred, err, fp, fn],
-            columns=cols + ['y', 'y_pred', 'err', 'fp', 'fn']
-        )
-    else:
-        err = y - y_pred
-        X = pd.DataFrame(
-            np.c_[X, y, y_pred, err],
-            columns=cols + ['y', 'y_pred', 'err']
-        )
+        raise ValueError("Unknown target col")
     
-    target = X[target_col]
-    target.name = 'performance metric'  # to make sure webapp works
-
-    if binary_target:
-        X = X.drop(['y', 'y_pred', 'err', 'fp', 'fn'], axis=1)
+    if len(target) == 0:
+        # Happens sometimes with fp_prec / fn_rec
+        return None
+    
+    # Obtain cluster labels
+    if method in ['kmeans', 'kmeans_cv']:
+        cluster_model = KMeans(n_clusters=5)
+        if method == 'kmeans':
+            cluster_model.fit(X_train)
+            labels = cluster_model.predict(X)
+        else:
+            labels = cluster_model.fit_predict(X)
+    elif method == 'hbac':
+        hbac = BiasAwareHierarchicalKMeans(n_iter=10, min_cluster_size=5)
+        hbac.fit(X, target)
+        labels = hbac.labels_
+    elif method == 'randomclusters':
+        labels = np.random.choice(range(5), size=X.shape[0])
     else:
-        X = X.drop(['y', 'y_pred', 'err'], axis=1)
- 
-    return X, target
+        raise ValueError(f"Not a known method ({method})")
+
+    return X, target, labels
 
 
-def check_before_test(c0, c1, min_samples=3):
-
+def check_before_test(c0, c1, min_samples=5):
+    """Determines whether to do significance testing
+    (don't do this with too few observations/constant data to avoid NaNs)."""
     if (c0.size < min_samples) or (c1.size < min_samples):
         return True
 
@@ -68,110 +92,120 @@ def check_before_test(c0, c1, min_samples=3):
     return False
 
 
-def simulate_experiment(N, K, target_col, binary_target, min_cluster_size, bonf_correct=False, alpha=0.05, iters=100, verbose=False):
+def compute_statistics(X, target, idx, bonf_correct, n_clust):
+    """Compute statistics for each cluster/feature."""
+    c1, c0 = target[idx], target[~idx]
+    _, p_clust = ttest_ind(c1, c0, equal_var=False)
     
-    sig_clust = np.zeros(iters)
-    sig_feat = np.zeros(iters)
-    hbac = BiasAwareHierarchicalKMeans(n_iter=5, min_cluster_size=min_cluster_size)
+    if bonf_correct:
+        p_clust = p_clust * n_clust
+
+    diff_clust = c1.mean() - c0.mean()
+    
+    p_feat, diff_feat = [], []
+    for ii in range(X.shape[1]):
+        X_ = X[:, ii]
+        c1, c0 = X_[idx], X_[~idx]
+
+        should_continue = check_before_test(c0, c1)
+        if should_continue:
+            continue
+        
+        _, p = ttest_ind(c1, c0)
+        if bonf_correct:
+            p = p * X.shape[1]
+
+        p_feat.append(p)
+        diff = c1.mean() - c0.mean()
+        diff_feat.append(diff)
+
+    return p_clust, diff_clust, p_feat, diff_feat
+
+
+def simulate_experiment(method, N, K, target_col, bonf_correct=False, iters=100):
+    
+    results_clust = defaultdict(list)
+    results_feat = defaultdict(list)
+
+    params_ = list(zip(
+        ['method', 'N', 'K', 'target_col', 'bonf_correct'],
+        [method, N, K, target_col, bonf_correct]
+    ))
 
     for i in range(iters):
-        X, target = simulate_null_data(N, K, target_col, binary_target)
-        X = X.to_numpy()
-        target = target.to_numpy()
-        hbac.fit(X, target)
 
-        clust_p = []
-        diff, label = 0, 0
-        for ii, l in enumerate(np.unique(hbac.labels_)):
-            c0 = target[hbac.labels_ != l]
-            c1 = target[hbac.labels_ == l]
+        out = simulate_null_data(method, N, K, target_col)
 
+        if out is None:
+            # Sometimes the data is empty because there are no FPs/FNs
+            continue
+
+        X, target, labels = out
+        if X.shape[0] <= 5:
+            # Sometimes there are too few observations
+            continue
+
+        # For each cluster, compute statistics separately
+        n_clust = np.unique(labels).size
+        for  l in np.unique(labels):
+            # Define cluster 1 (with label) and cluster 0 (~label)
+            idx = labels == l
+            c1, c0 = target[idx], target[~idx]
             should_continue = check_before_test(c0, c1)
             if should_continue:
+                # With too few data/constant data, stats cannot be computed, so continue
                 continue
 
-            _, p = ttest_ind(c0, c1, equal_var=False)
-            clust_p.append(p)
-            this_diff = c0.mean() - c1.mean()
+            # Compute cluster stats and save in container
+            p_clust, diff_clust, p_feat, diff_feat = compute_statistics(X, target, idx, bonf_correct, n_clust)
+            results_clust['iter'].append(i)
+            results_clust['cluster_nr'].append(l)
+            results_clust['p_clust'].append(p_clust)
+            results_clust['diff_clust'].append(diff_clust)
+            results_clust['size_clust'].append(idx.sum())
 
-            if np.abs(this_diff) > diff:
-                diff = copy(this_diff)
-                label = copy(l)
-        
-        idx = hbac.labels_ == label#np.random.choice(hbac.labels_)
-        feat_p = []
-        for ii in range(K):
-            X_ = X[:, ii]
-            c0 = X_[idx]
-            c1 = X_[~idx]
+            for p_name_, p_ in params_:
+                # Save params
+                results_clust[p_name_].append(p_)
 
-            should_continue = check_before_test(c0, c1)
-            if should_continue:
-                continue
-            
-            _, p = ttest_ind(c0, c1)
-            if np.isnan(p):
-                print(c0, c1)
-            feat_p.append(p)
+            # Save feature stats separately
+            for i_feat, (p_feat_, diff_feat_) in enumerate(zip(p_feat, diff_feat)):
+                results_feat['iter'].append(i)
+                results_feat['feat_nr'].append(i_feat)
+                results_feat['p_feat'].append(p_feat_)
+                results_feat['diff_feat'].append(diff_feat_)
+                results_feat['size_feat'].append(idx.sum())
 
-        feat_p = np.array(feat_p)
-        alpha_f = alpha / K if bonf_correct else alpha
-        sig_feat[i] = (feat_p < alpha_f).sum() / K
-        
-        clust_p = np.array(clust_p)
-        alpha_f = alpha / hbac.n_clusters_ if bonf_correct else alpha
-        sig_clust[i] = (clust_p < alpha_f).sum() / hbac.n_clusters_
+                for p_name, p_ in params_:
+                    results_feat[p_name].append(p_)
 
-    fpr_feat = (sig_feat > 0).mean()
-    ev_feat = sig_feat.mean()
+    results_clust = pd.DataFrame(results_clust)
+    results_feat = pd.DataFrame(results_feat)
 
-    fpr_clust = (sig_clust > 0).mean()
-    ev_clust = sig_clust.mean() 
-
-    if verbose:
-        print(f"FPR (cluster): {fpr_clust:.3f}")
-        print(f"Exp. value (cluster): {ev_clust:.3f}")
-        print(f"FPR (feature): {fpr_feat:.3f}")
-        print(f"Exp. value (feature): {ev_feat:.3f}")
-
-    return fpr_feat, ev_feat, fpr_clust, ev_clust 
+    return results_clust, results_feat
 
 
 if __name__ == '__main__':
 
-    ITERS = 100
-    ALPHA = 0.05
-    BONF_CORRECT = False
+    from params import ITERS
+    from params import params
 
-    N = [50, 100, 500, 1000]
-    K = [1, 5, 10, 50, 100]
-    target_col = ['y', 'y_pred', 'fp', 'fn', 'err']
-    binary_target = [True]
-    min_cluster_size = [5, 10, 50, 100]
-
-    params = list(product(N, K, target_col, binary_target, min_cluster_size))    
-    results = defaultdict(list)
+    results_clust, results_feat = [], []
     for params in tqdm(params):
-        n, k, target_col_, binary_target_, min_cluster_size_ = params
 
-        if not binary_target_ and target_col_ in ['fp', 'fn']:
-            continue
+        method, n, k, target_col, bonf_correct = params
 
-        if n <= min_cluster_size_:
-            continue
-
-        fpr_feat, ev_feat, fpr_clust, ev_clust = simulate_experiment(
-            n, k, target_col_, binary_target_, min_cluster_size_,
-            bonf_correct=BONF_CORRECT, alpha=ALPHA, iters=ITERS
+        results_clust_, results_feat_ = simulate_experiment(
+            # Run experiment with `method`
+            method, n, k, target_col, bonf_correct=bonf_correct, iters=ITERS
         )
-        
-        results['fpr_feat'].append(fpr_feat)
-        results['ev_feat'].append(ev_feat)
-        results['fpr_clust'].append(fpr_clust)
-        results['ev_clust'].append(ev_clust)
 
-        for p_name, p in zip(['N', 'K', 'target', 'binary', 'min_cluster_size'], params):
-            results[p_name].append(p)
+        results_clust.append(results_clust_)
+        results_feat.append(results_feat_)
 
-    results = pd.DataFrame(results)
-    results.to_csv('./results_.csv', index=False)
+    results_clust = pd.concat(results_clust, axis=0)
+    results_feat = pd.concat(results_feat, axis=0)
+    f_out = Path(__file__).parent / 'results_clust.csv'
+    results_clust.to_csv(f_out, index=False)
+    f_out = Path(__file__).parent / 'results_feat.csv'
+    results_feat.to_csv(f_out, index=False)
